@@ -87,15 +87,29 @@ jobs:
       VER: ${{ needs.prepare.outputs.ver }}
       REL: ${{ needs.prepare.outputs.release }}
     steps:
-      # While ping_tool is public the token checkout works and the key is unused; once it
-      # is private, PING_TOOL_DEPLOY_KEY (read-only deploy key on ping_tool) is REQUIRED.
-      - name: Check out ping_tool at the tag
-        uses: actions/checkout@v4
-        with:
-          repository: haneeshbyreddy/ping_tool
-          ref: refs/tags/${{ needs.prepare.outputs.tag }}
-          fetch-depth: 0
-          ssh-key: ${{ secrets.PING_TOOL_DEPLOY_KEY }}
+      # Manual clone, not actions/checkout: the secret is normalized (trailing newline,
+      # no CRs) and VALIDATED first — a key pasted without its final newline makes ssh
+      # say "error in libcrypto", which reads like a broken runner. GitHub's host key
+      # is pinned, never keyscanned.
+      - name: Fetch ping_tool at the tag (deploy key)
+        shell: bash
+        env:
+          KEY: ${{ secrets.PING_TOOL_DEPLOY_KEY }}
+          REF: ${{ needs.prepare.outputs.tag }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::PING_TOOL_DEPLOY_KEY is not set on this repo — ping_tool is private and cannot be read without it"; exit 1
+          fi
+          tmp="$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")"
+          keyfile="$tmp/deploy_key"; kh="$tmp/known_hosts"
+          printf '%s\n' "$KEY" | tr -d '\r' > "$keyfile"; chmod 600 "$keyfile"
+          if ! ssh-keygen -y -f "$keyfile" >/dev/null 2>&1; then
+            echo "::error::PING_TOOL_DEPLOY_KEY is not a valid OpenSSH private key — re-paste the WHOLE file, from '-----BEGIN OPENSSH PRIVATE KEY-----' through '-----END OPENSSH PRIVATE KEY-----'"; exit 1
+          fi
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$kh"
+          export GIT_SSH_COMMAND="ssh -i $keyfile -o UserKnownHostsFile=$kh -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
+          git clone --quiet --depth 1 --branch "$REF" git@github.com:haneeshbyreddy/ping_tool.git .
+          echo "fetched $(git log -1 --format='%h' ) at $REF"
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
 
@@ -103,7 +117,7 @@ jobs:
         shell: bash
         run: |
           echo "VERSION = \"$VER\"" > src/wisp/_buildinfo.py
-          echo "built version: $VER (git: $(git describe --tags --always))"
+          echo "built version: $VER"
 
       - name: Install build deps
         run: pip install -r requirements.txt pyinstaller

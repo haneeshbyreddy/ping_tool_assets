@@ -17,14 +17,30 @@ jobs:
   checkout:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: haneeshbyreddy/ping_tool
-          ref: main
-          fetch-depth: 0
-          ssh-key: ${{ secrets.PING_TOOL_DEPLOY_KEY }}
+      # Manual clone, not actions/checkout: the secret is normalized (trailing newline,
+      # no CRs) and VALIDATED first — a key pasted without its final newline makes ssh
+      # say "error in libcrypto", which reads like a broken runner. GitHub's host key
+      # is pinned, never keyscanned.
+      - name: Fetch ping_tool at main (deploy key)
+        shell: bash
+        env:
+          KEY: ${{ secrets.PING_TOOL_DEPLOY_KEY }}
+          REF: main
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::PING_TOOL_DEPLOY_KEY is not set on this repo — ping_tool is private and cannot be read without it"; exit 1
+          fi
+          tmp="$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")"
+          keyfile="$tmp/deploy_key"; kh="$tmp/known_hosts"
+          printf '%s\n' "$KEY" | tr -d '\r' > "$keyfile"; chmod 600 "$keyfile"
+          if ! ssh-keygen -y -f "$keyfile" >/dev/null 2>&1; then
+            echo "::error::PING_TOOL_DEPLOY_KEY is not a valid OpenSSH private key — re-paste the WHOLE file, from '-----BEGIN OPENSSH PRIVATE KEY-----' through '-----END OPENSSH PRIVATE KEY-----'"; exit 1
+          fi
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$kh"
+          export GIT_SSH_COMMAND="ssh -i $keyfile -o UserKnownHostsFile=$kh -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
+          git clone --quiet --depth 1 --branch "$REF" git@github.com:haneeshbyreddy/ping_tool.git .
+          echo "fetched $(git log -1 --format='%h' ) at $REF"
       - name: Report
         run: |
           echo "head: $(git log -1 --format='%h %s' | cut -c1-100)"
-          echo "newest tags: $(git tag --sort=-v:refname | head -3 | tr '\n' ' ')"
           test -f deploy/wisp-edge.spec && echo "spec present"
