@@ -11,6 +11,11 @@ Releases are tagged by component and version:
 
 Every release includes a `manifest.json` with the sha256 of each artifact.
 
+Edge releases are built here, by this repo's `edge-release` workflow, from a tag of
+the private source repo, and published as a draft that flips to public only once every
+platform's binary and the manifest are in place. A release with a `-` in the asset list
+or no `manifest.json` is one that is still building.
+
 ## Windows edge
 
 1. Download `wisp-edge-setup-win-amd64.exe` from the latest `edge-v*` release.

@@ -1,0 +1,290 @@
+name: edge-release
+
+# Builds the edge probe from the PRIVATE monorepo (haneeshbyreddy/ping_tool) at one tag
+# and publishes the result as an `edge-vX.Y.Z` release on THIS public repo.
+#
+# Why here and not in ping_tool: a private repo's Actions come with a 500 MB artifact
+# quota and metered minutes. On 2026-09-03 v0.17.0's three builds all died on
+# "Artifact storage quota has been hit", the release job was skipped, and the tag
+# looked shipped while nothing was published. A public repo has neither limit, and
+# this workflow uses no artifacts at all: every platform uploads straight to a DRAFT
+# release, and the last job assembles the manifest and publishes it. Central's mirror
+# lists PUBLISHED releases only, so a half-built release can never become "latest".
+#
+# What is public: this file, the run logs (pip/PyInstaller output, file names) and the
+# binaries. The source itself is checked out with a read-only deploy key
+# (secrets.PING_TOOL_DEPLOY_KEY) and never leaves the runner.
+#
+# Triggers: ping_tool's tag run sends `repository_dispatch` (event edge-release,
+# client_payload.tag = "vX.Y.Z") after its tests pass; `workflow_dispatch` is the hand
+# lever for a re-run. Both take the ping_tool TAG (vX.Y.Z), not the release tag.
+
+on:
+  repository_dispatch:
+    types: [edge-release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "ping_tool tag to build (vX.Y.Z)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: edge-release-${{ github.event.client_payload.tag || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  SRC_REPO: haneeshbyreddy/ping_tool
+  TAG: ${{ github.event.client_payload.tag || inputs.tag }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      ver: ${{ steps.v.outputs.ver }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - name: Resolve tag and open the draft release
+        id: v
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "::error::tag must look like vX.Y.Z, got '$TAG'"; exit 1 ;;
+          esac
+          VER="${TAG#v}"
+          REL="edge-v$VER"
+          if gh release view "$REL" --json isDraft -q .isDraft >/tmp/draft 2>/dev/null; then
+            if [ "$(cat /tmp/draft)" != "true" ]; then
+              echo "::error::$REL is already PUBLISHED — installed probes may have it; bump the version instead of rebuilding a shipped release"
+              exit 1
+            fi
+            echo "reusing draft $REL"
+          else
+            gh release create "$REL" --draft --title "Edge agent v$VER" \
+              --notes "Building — assets are uploaded as each platform finishes."
+            echo "created draft $REL"
+          fi
+          { echo "tag=$TAG"; echo "ver=$VER"; echo "release=$REL"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    plat: linux-amd64, ext: "" }
+          - { runner: ubuntu-24.04-arm, plat: linux-arm64, ext: "" }
+          - { runner: windows-latest,   plat: win-amd64,   ext: ".exe" }
+    runs-on: ${{ matrix.runner }}
+    env:
+      VER: ${{ needs.prepare.outputs.ver }}
+      REL: ${{ needs.prepare.outputs.release }}
+    steps:
+      # While ping_tool is public the token checkout works and the key is unused; once it
+      # is private, PING_TOOL_DEPLOY_KEY (read-only deploy key on ping_tool) is REQUIRED.
+      - name: Check out ping_tool at the tag
+        uses: actions/checkout@v4
+        with:
+          repository: haneeshbyreddy/ping_tool
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
+          ssh-key: ${{ secrets.PING_TOOL_DEPLOY_KEY }}
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Stamp version from the tag
+        shell: bash
+        run: |
+          echo "VERSION = \"$VER\"" > src/wisp/_buildinfo.py
+          echo "built version: $VER (git: $(git describe --tags --always))"
+
+      - name: Install build deps
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build agent + supervisor
+        shell: bash
+        run: |
+          pyinstaller --clean -y deploy/wisp-edge.spec
+          pyinstaller --clean -y --onefile --name wisp-supervisor \
+            --paths src --hidden-import httpx apps/supervisor/main.py
+          mkdir -p out
+          cp "dist/wisp-edge${{ matrix.ext }}"       "out/wisp-edge-${{ matrix.plat }}${{ matrix.ext }}"
+          cp "dist/wisp-supervisor${{ matrix.ext }}" "out/wisp-supervisor-${{ matrix.plat }}${{ matrix.ext }}"
+
+      - name: Build tray app (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          pyinstaller --clean -y --onefile --noconsole --name wisp-tray \
+            --paths src apps/tray/main.py
+          cp dist/wisp-tray.exe out/wisp-tray-${{ matrix.plat }}.exe
+
+      - name: Sign (Windows, Authenticode)
+        if: runner.os == 'Windows' && env.WINDOWS_CODESIGN_PFX != ''
+        env:
+          WINDOWS_CODESIGN_PFX: "${{ secrets.WINDOWS_CODESIGN_PFX }}"
+          WINDOWS_CODESIGN_PASSWORD: "${{ secrets.WINDOWS_CODESIGN_PASSWORD }}"
+        shell: pwsh
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "wisp-codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" `
+            -ErrorAction Stop | Sort-Object FullName -Descending | Select-Object -First 1
+          & $signtool.FullName sign /f $pfxPath /p $env:WINDOWS_CODESIGN_PASSWORD `
+            /fd sha256 /tr http://timestamp.digicert.com /td sha256 `
+            "out/wisp-edge-${{ matrix.plat }}${{ matrix.ext }}" `
+            "out/wisp-supervisor-${{ matrix.plat }}${{ matrix.ext }}" `
+            "out/wisp-tray-${{ matrix.plat }}${{ matrix.ext }}"
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed with exit code $LASTEXITCODE" }
+          Remove-Item $pfxPath -Force
+          & $signtool.FullName verify /pa "out/wisp-edge-${{ matrix.plat }}${{ matrix.ext }}"
+          if ($LASTEXITCODE -ne 0) { throw "signtool verify failed on wisp-edge" }
+
+      - name: Build .deb package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          deploy/build-deb.sh "$VER" "${{ matrix.plat }}" \
+            "out/wisp-edge-${{ matrix.plat }}" "out/wisp-supervisor-${{ matrix.plat }}" out
+
+      - name: Build Windows setup exe (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          $outDir = Join-Path (Get-Location).Path 'out'
+          & $iscc deploy\wisp-edge-setup.iss /DAppVersion=$env:VER "/DBinDir=$outDir" "/DOutDir=$outDir"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+      - name: Sign setup exe (Windows, Authenticode)
+        if: runner.os == 'Windows' && env.WINDOWS_CODESIGN_PFX != ''
+        env:
+          WINDOWS_CODESIGN_PFX: "${{ secrets.WINDOWS_CODESIGN_PFX }}"
+          WINDOWS_CODESIGN_PASSWORD: "${{ secrets.WINDOWS_CODESIGN_PASSWORD }}"
+        shell: pwsh
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "wisp-codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" `
+            -ErrorAction Stop | Sort-Object FullName -Descending | Select-Object -First 1
+          & $signtool.FullName sign /f $pfxPath /p $env:WINDOWS_CODESIGN_PASSWORD `
+            /fd sha256 /tr http://timestamp.digicert.com /td sha256 `
+            "out/wisp-edge-setup-win-amd64.exe"
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed with exit code $LASTEXITCODE" }
+          Remove-Item $pfxPath -Force
+
+      - name: Per-platform checksums
+        shell: bash
+        run: (cd out && sha256sum * > "SHA256SUMS-${{ matrix.plat }}")
+
+      # Straight onto the draft release — no Actions artifact anywhere in this workflow.
+      - name: Upload to the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "$REL" out/* --clobber
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    env:
+      VER: ${{ needs.prepare.outputs.ver }}
+      REL: ${{ needs.prepare.outputs.release }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download every platform's assets from the draft
+        shell: bash
+        run: |
+          mkdir -p release
+          gh release download "$REL" -D release --pattern '*'
+          ls -l release
+
+      - name: Assemble checksums + self-update manifest
+        shell: bash
+        run: |
+          (cd release && cat SHA256SUMS-* > SHA256SUMS)
+          python - "$VER" "$REL" > release/manifest.json <<'PY'
+          import hashlib, json, sys, pathlib
+          ver, rel = sys.argv[1], sys.argv[2]; out = pathlib.Path("release"); arts = {}
+          base = f"https://github.com/${{ github.repository }}/releases/download/{rel}"
+          for p in sorted(out.glob("wisp-edge-*")):
+              # first-install artifacts (Windows setup exe, .debs) are not self-update payloads
+              if p.name.startswith("wisp-edge-setup") or p.name.endswith(".deb"):
+                  continue
+              plat = p.name.replace("wisp-edge-", "").replace(".exe", "")
+              arts[plat] = {"url": f"{base}/{p.name}",
+                            "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+          if len(arts) != 3:
+              sys.exit(f"expected 3 agent binaries, found {sorted(arts)}")
+          json.dump({"version": ver, "artifacts": arts}, sys.stdout, indent=2)
+          PY
+          cat release/manifest.json
+
+      # GitHub can't hide individual release assets, so the asset list always shows the
+      # self-update binaries too — the notes BODY steers humans.
+      - name: Write install-first release notes
+        shell: bash
+        run: |
+          BASE="https://github.com/${{ github.repository }}/releases/download/$REL"
+          {
+            echo "## Install"
+            echo
+            echo "| Platform | Download this one file |"
+            echo "|---|---|"
+            echo "| Windows | [wisp-edge-setup-win-amd64.exe]($BASE/wisp-edge-setup-win-amd64.exe) |"
+            for deb in release/wisp-edge-*.deb; do
+              name="$(basename "$deb")"
+              case "$name" in
+                *-amd64.deb) plat="Debian/Ubuntu (amd64)" ;;
+                *-arm64.deb) plat="Debian/Ubuntu (arm64)" ;;
+                *)           plat="Debian/Ubuntu" ;;
+              esac
+              echo "| $plat | [$name]($BASE/$name) |"
+            done
+            echo
+            echo "**Those are the only files you need.** Everything else in the asset"
+            echo "list (\`wisp-edge-*\` / \`wisp-supervisor-*\` bare binaries,"
+            echo "\`manifest.json\`) is the self-update channel — installed probes fetch"
+            echo "those automatically through central's staged rollout. \`SHA256SUMS\`"
+            echo "(+ \`.minisig\`) is for verifying downloads by hand."
+            echo
+            echo "Built from \`haneeshbyreddy/ping_tool\` tag \`v$VER\`."
+          } > RELEASE_NOTES.md
+
+      # One minisign signature over the checksums covers every artifact transitively.
+      # No-op until MINISIGN_KEY (a PASSWORD-LESS secret key, base64) is set on this repo;
+      # the public half belongs in ping_tool's deploy/minisign.pub.
+      - name: Sign checksums (minisign)
+        if: env.MINISIGN_KEY != ''
+        env: { MINISIGN_KEY: "${{ secrets.MINISIGN_KEY }}" }
+        shell: bash
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          keyfile="$(mktemp)"
+          trap 'shred -u "$keyfile"' EXIT
+          printf '%s' "$MINISIGN_KEY" | base64 -d > "$keyfile"
+          minisign -S -s "$keyfile" -m release/SHA256SUMS -x release/SHA256SUMS.minisig \
+            -t "wisp-edge $VER" </dev/null
+
+      # manifest.json goes up BEFORE the draft flips: central refuses a release without it.
+      - name: Publish
+        shell: bash
+        run: |
+          gh release upload "$REL" release/manifest.json release/SHA256SUMS --clobber
+          [ -f release/SHA256SUMS.minisig ] && gh release upload "$REL" release/SHA256SUMS.minisig --clobber
+          for f in release/SHA256SUMS-*; do
+            gh release delete-asset "$REL" "$(basename "$f")" -y
+          done
+          gh release edit "$REL" --draft=false \
+            --title "Edge agent v$VER" --notes-file RELEASE_NOTES.md
+          echo "published: https://github.com/${{ github.repository }}/releases/tag/$REL"
