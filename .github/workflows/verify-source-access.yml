@@ -1,0 +1,30 @@
+name: verify-source-access
+
+# Side-effect-free check that this repo can still read the PRIVATE source with
+# secrets.PING_TOOL_DEPLOY_KEY — the exact checkout edge-release performs, without
+# building or publishing anything. Run it after rotating the deploy key, or whenever
+# a build fails at "Check out ping_tool at the tag". Prints only the head and tags.
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [verify-source-access]
+
+permissions:
+  contents: read
+
+jobs:
+  checkout:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: haneeshbyreddy/ping_tool
+          ref: main
+          fetch-depth: 0
+          ssh-key: ${{ secrets.PING_TOOL_DEPLOY_KEY }}
+      - name: Report
+        run: |
+          echo "head: $(git log -1 --format='%h %s' | cut -c1-100)"
+          echo "newest tags: $(git tag --sort=-v:refname | head -3 | tr '\n' ' ')"
+          test -f deploy/wisp-edge.spec && echo "spec present"
