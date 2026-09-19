@@ -132,6 +132,14 @@ jobs:
           cp "dist/wisp-edge${{ matrix.ext }}"       "out/wisp-edge-${{ matrix.plat }}${{ matrix.ext }}"
           cp "dist/wisp-supervisor${{ matrix.ext }}" "out/wisp-supervisor-${{ matrix.plat }}${{ matrix.ext }}"
 
+      # The release gate. The supervisor just built must swap a RUNNING onefile agent
+      # on this OS. Windows refuses to overwrite a running image, which is how every
+      # Windows rollout before 0.18 stalled while Linux passed. A red step here prints
+      # the supervisor's log, and nothing is uploaded to the draft.
+      - name: Update smoke (the built supervisor swaps a running onefile agent)
+        shell: bash
+        run: python tools/update_smoke.py --supervisor "dist/wisp-supervisor${{ matrix.ext }}"
+
       - name: Build tray app (Windows)
         if: runner.os == 'Windows'
         shell: bash
