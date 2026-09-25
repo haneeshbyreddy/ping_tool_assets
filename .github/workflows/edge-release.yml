@@ -122,6 +122,64 @@ jobs:
       - name: Install build deps
         run: pip install -r requirements.txt pyinstaller
 
+      # Live camera video: the agent carries go2rtc inside its onefile image, so it rides
+      # the same self-update as the agent itself. Pinned by version AND by the sha256 of
+      # the exact release asset; a mismatch stops the build before PyInstaller runs.
+      # WISP_REQUIRE_GO2RTC makes deploy/wisp-edge.spec refuse to build without it.
+      - name: Vendor go2rtc (pinned release, sha256-checked)
+        shell: bash
+        env:
+          GO2RTC_VER: "1.9.14"
+          PLAT: ${{ matrix.plat }}
+        run: |
+          python - <<'PY'
+          import hashlib, io, os, pathlib, sys, urllib.request, zipfile
+          pins = {
+              "linux-amd64": ("go2rtc_linux_amd64", "go2rtc",
+                              "32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6"),
+              "linux-arm64": ("go2rtc_linux_arm64", "go2rtc",
+                              "359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50"),
+              "win-amd64":   ("go2rtc_win64.zip", "go2rtc.exe",
+                              "dd4167d75cb04abe618855b7c71f8658bd009f60c1a71835d134d2c11c939907"),
+          }
+          asset, name, want = pins[os.environ["PLAT"]]
+          url = ("https://github.com/AlexxIT/go2rtc/releases/download/"
+                 f"v{os.environ['GO2RTC_VER']}/{asset}")
+          data = urllib.request.urlopen(url, timeout=120).read()
+          got = hashlib.sha256(data).hexdigest()
+          if got != want:
+              sys.exit(f"::error::{asset} sha256 is {got}, pinned {want} — refusing to bundle it")
+          if asset.endswith(".zip"):
+              data = zipfile.ZipFile(io.BytesIO(data)).read(name)
+          out = pathlib.Path("deploy/vendor/go2rtc") / name
+          out.parent.mkdir(parents=True, exist_ok=True)
+          out.write_bytes(data)
+          out.chmod(0o755)
+          print(f"vendored {out} ({len(data)} bytes) from {asset} sha256 {got}")
+          PY
+          echo "WISP_REQUIRE_GO2RTC=1" >> "$GITHUB_ENV"
+
+      # Signed after the sha256 check (signing rewrites the file) and before PyInstaller
+      # bundles it, so Defender sees a signed child when the agent launches go2rtc.
+      - name: Sign go2rtc (Windows, Authenticode)
+        if: runner.os == 'Windows' && env.WINDOWS_CODESIGN_PFX != ''
+        env:
+          WINDOWS_CODESIGN_PFX: "${{ secrets.WINDOWS_CODESIGN_PFX }}"
+          WINDOWS_CODESIGN_PASSWORD: "${{ secrets.WINDOWS_CODESIGN_PASSWORD }}"
+        shell: pwsh
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "wisp-codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" `
+            -ErrorAction Stop | Sort-Object FullName -Descending | Select-Object -First 1
+          & $signtool.FullName sign /f $pfxPath /p $env:WINDOWS_CODESIGN_PASSWORD `
+            /fd sha256 /tr http://timestamp.digicert.com /td sha256 `
+            "deploy\vendor\go2rtc\go2rtc.exe"
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed on go2rtc.exe with exit code $LASTEXITCODE" }
+          Remove-Item $pfxPath -Force
+          & $signtool.FullName verify /pa "deploy\vendor\go2rtc\go2rtc.exe"
+          if ($LASTEXITCODE -ne 0) { throw "signtool verify failed on go2rtc.exe" }
+
       - name: Build agent + supervisor
         shell: bash
         run: |
